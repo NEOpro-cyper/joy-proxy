@@ -1,44 +1,44 @@
 // Bypass SSL verification globally (Mimics PHP's CURLOPT_SSL_VERIFYPEER => false)
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
-const express = require('express');
-const app = express();
+const http = require('http');
 
-app.use(express.raw({ type: '*/*', limit: '50mb' }));
-
-app.all('*', async (req, res) => {
+const server = http.createServer(async (req, res) => {
     // 1. Handle CORS
-    res.set({
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-        'Access-Control-Allow-Headers': '*'
-    });
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', '*');
 
     if (req.method === 'OPTIONS') {
-        return res.status(204).end();
+        res.writeHead(204);
+        return res.end();
     }
 
-    // 2. Extract Target URL
-    let requestUri = req.originalUrl;
+    // 2. Extract Target URL directly from the raw request
+    let requestUri = req.url;
     
-    // Decode in case the proxy URL-encoded the slashes (e.g., %2F)
+    // Decode in case the proxy/player URL-encoded the slashes (e.g., %2F)
     try {
-        requestUri = decodeURIComponent(requestUri);
+        if (requestUri.includes('%')) {
+            requestUri = decodeURIComponent(requestUri);
+        }
     } catch (e) {}
 
     const posHttp = requestUri.indexOf('http://');
     const posHttps = requestUri.indexOf('https://');
 
     if (posHttp === -1 && posHttps === -1) {
-        return res.status(400).set('Content-Type', 'text/plain').send(
-            `Invalid proxy usage. Format: https://your-domain.com/https://target.com/path\n\nDebug Info:\nreq.url: ${req.url}\nreq.originalUrl: ${req.originalUrl}\nDecoded: ${requestUri}`
+        res.writeHead(400, { 'Content-Type': 'text/plain' });
+        return res.end(
+            `Invalid proxy usage. Format: https://your-domain.com/https://target.com/path\n\n` +
+            `Debug Info:\nreq.url: ${req.url}\nDecoded: ${requestUri}`
         );
     }
 
     const startPos = (posHttp !== -1 && (posHttps === -1 || posHttp < posHttps)) ? posHttp : posHttps;
     const targetUrlStr = requestUri.substring(startPos);
 
-    // 3. Prepare Headers
+    // 3. Prepare Headers (Matching your PHP cURL headers)
     const modifiedHeaders = {
         'Referer': 'https://cinejoy.to/',
         'Origin': 'https://cinejoy.to',
@@ -59,8 +59,13 @@ app.all('*', async (req, res) => {
         redirect: 'follow'
     };
 
+    // Handle POST/PUT bodies manually
     if (req.method !== 'GET' && req.method !== 'HEAD') {
-        fetchOptions.body = req.body;
+        const chunks = [];
+        for await (const chunk of req) {
+            chunks.push(chunk);
+        }
+        fetchOptions.body = Buffer.concat(chunks);
     }
 
     try {
@@ -69,21 +74,22 @@ app.all('*', async (req, res) => {
 
         // SPECIAL CHECK: dontscrape loop
         if (finalUrl.includes('dontscrape')) {
-            return res.status(403).set('Content-Type', 'text/plain').send(
-                `WAF Block Detected!\nThe target server trapped this request in the dontscrape loop.\nFinal URL: ${finalUrl}\nThis means the server is actively blocking your VPS IP or the spoofed headers.`
+            res.writeHead(403, { 'Content-Type': 'text/plain' });
+            return res.end(
+                `WAF Block Detected!\nThe target server trapped this request in the dontscrape loop.\n` +
+                `Final URL: ${finalUrl}\nThis means the server is actively blocking your VPS IP or the spoofed headers.`
             );
         }
 
         const contentType = response.headers.get('content-type') || '';
         const isM3u8 = contentType.includes('mpegurl') || targetUrlStr.endsWith('.m3u8');
 
-        res.status(response.status);
+        res.writeHead(response.status, {
+            'Content-Type': isM3u8 ? 'application/vnd.apple.mpegurl' : (contentType || 'application/octet-stream')
+        });
 
         if (!isM3u8) {
-            if (response.headers.get('content-type')) {
-                res.set('Content-Type', response.headers.get('content-type'));
-            }
-            
+            // Not an m3u8, pipe the stream directly to save memory
             const reader = response.body.getReader();
             while (true) {
                 const { done, value } = await reader.read();
@@ -96,7 +102,10 @@ app.all('*', async (req, res) => {
         // IT IS AN M3U8 - REWRITE URLS
         const bodyText = await response.text();
         
-        const workerBase = req.protocol + '://' + req.get('host') + '/';
+        // Respect Coolify's reverse proxy headers for HTTPS
+        const host = req.headers.host;
+        const protocol = (req.headers['x-forwarded-proto'] || 'http').split(',')[0].trim();
+        const workerBase = `${protocol}://${host}/`;
 
         const targetUrlParts = new URL(finalUrl);
         const targetOrigin = targetUrlParts.origin;
@@ -110,6 +119,7 @@ app.all('*', async (req, res) => {
             if (trimmed === '') return line;
 
             if (trimmed.startsWith('#')) {
+                // Handle URI="..." attributes inside tags
                 return line.replace(/URI="([^"]+)"/g, (match, uri) => {
                     let absolute = uri;
                     if (uri.startsWith('http://') || uri.startsWith('https://')) {
@@ -124,6 +134,7 @@ app.all('*', async (req, res) => {
                     return 'URI="' + workerBase + absolute + '"';
                 });
             } else {
+                // Non-comment line = segment/playlist URL
                 let absolute = trimmed;
                 if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
                     absolute = trimmed;
@@ -139,19 +150,18 @@ app.all('*', async (req, res) => {
         });
 
         const rewrittenText = rewrittenLines.join('\n');
-
-        res.set('Content-Type', 'application/vnd.apple.mpegurl');
-        return res.send(rewrittenText);
+        return res.end(rewrittenText);
 
     } catch (error) {
         console.error('[PROXY] Fetch Error:', error.message);
         if (!res.headersSent) {
-            return res.status(500).set('Content-Type', 'text/plain').send('Error: ' + error.message);
+            res.writeHead(500, { 'Content-Type': 'text/plain' });
+            return res.end('Error: ' + error.message);
         }
     }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`Proxy server running on port ${PORT}`);
+server.listen(PORT, () => {
+    console.log(`Pure Node.js proxy server running on port ${PORT}`);
 });
