@@ -71,6 +71,7 @@ const server = http.createServer(async (req, res) => {
     try {
         const response = await fetch(targetUrlStr, fetchOptions);
         const finalUrl = response.url; // Get final URL after redirects
+        const contentType = response.headers.get('content-type') || '';
 
         // SPECIAL CHECK: dontscrape loop
         if (finalUrl.includes('dontscrape')) {
@@ -81,78 +82,114 @@ const server = http.createServer(async (req, res) => {
             );
         }
 
-        const contentType = response.headers.get('content-type') || '';
-        const isM3u8 = contentType.includes('mpegurl') || targetUrlStr.endsWith('.m3u8');
+        // Determine if this URL might be a disguised M3U8 file (to avoid loading huge video files into memory)
+        const isPotentialM3u8 = 
+            targetUrlStr.endsWith('.m3u8') || 
+            targetUrlStr.endsWith('.jpg') || 
+            targetUrlStr.endsWith('.png') || 
+            targetUrlStr.endsWith('.jpeg') || 
+            contentType.includes('mpegurl') || 
+            contentType.includes('text/');
 
-        res.writeHead(response.status, {
-            'Content-Type': isM3u8 ? 'application/vnd.apple.mpegurl' : (contentType || 'application/octet-stream')
-        });
+        if (isPotentialM3u8) {
+            // Safe to read into memory because these are usually small text/base64 files
+            const arrayBuffer = await response.arrayBuffer();
+            const buffer = Buffer.from(arrayBuffer);
+            let bodyText = buffer.toString('utf-8');
+            
+            let isBase64 = false;
+            let isM3u8 = false;
 
-        if (!isM3u8) {
-            // Not an m3u8, pipe the stream directly to save memory
-            const reader = response.body.getReader();
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                res.write(Buffer.from(value));
+            // Check if the response is Base64 encoded
+            if (/^[a-zA-Z0-9+/=\s]+$/.test(bodyText.trim())) {
+                try {
+                    const decoded = Buffer.from(bodyText, 'base64').toString('utf-8');
+                    if (decoded.trim().startsWith('#EXTM3U')) {
+                        isBase64 = true;
+                        isM3u8 = true;
+                        bodyText = decoded; // Use the decoded text for rewriting
+                    }
+                } catch (e) {}
             }
-            return res.end();
+            
+            // Check if it's a plain text M3U8
+            if (!isM3u8 && bodyText.trim().startsWith('#EXTM3U')) {
+                isM3u8 = true;
+            }
+
+            if (isM3u8) {
+                // REWRITE URLS
+                const host = req.headers.host;
+                const protocol = (req.headers['x-forwarded-proto'] || 'http').split(',')[0].trim();
+                const workerBase = `${protocol}://${host}/?t=`;
+
+                const targetUrlParts = new URL(finalUrl);
+                const targetOrigin = targetUrlParts.origin;
+                const targetProtocol = targetUrlParts.protocol.replace(':', '');
+                const targetPath = targetUrlParts.pathname;
+                const targetDir = targetPath.substring(0, targetPath.lastIndexOf('/') + 1);
+
+                const lines = bodyText.split('\n');
+                const rewrittenLines = lines.map(line => {
+                    const trimmed = line.trim();
+                    if (trimmed === '') return line;
+
+                    if (trimmed.startsWith('#')) {
+                        return line.replace(/URI="([^"]+)"/g, (match, uri) => {
+                            let absolute = uri;
+                            if (uri.startsWith('http://') || uri.startsWith('https://')) {
+                                absolute = uri;
+                            } else if (uri.startsWith('//')) {
+                                absolute = targetProtocol + ':' + uri;
+                            } else if (uri.startsWith('/')) {
+                                absolute = targetOrigin + uri;
+                            } else {
+                                absolute = targetOrigin + targetDir + uri;
+                            }
+                            return 'URI="' + workerBase + absolute + '"';
+                        });
+                    } else {
+                        let absolute = trimmed;
+                        if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+                            absolute = trimmed;
+                        } else if (trimmed.startsWith('//')) {
+                            absolute = targetProtocol + ':' + trimmed;
+                        } else if (trimmed.startsWith('/')) {
+                            absolute = targetOrigin + trimmed;
+                        } else {
+                            absolute = targetOrigin + targetDir + trimmed;
+                        }
+                        return workerBase + absolute;
+                    }
+                });
+
+                let rewrittenText = rewrittenLines.join('\n');
+
+                // If it was originally Base64, re-encode it before sending
+                if (isBase64) {
+                    rewrittenText = Buffer.from(rewrittenText).toString('base64');
+                    res.writeHead(response.status, { 'Content-Type': contentType || 'application/octet-stream' });
+                    return res.end(rewrittenText);
+                } else {
+                    res.writeHead(response.status, { 'Content-Type': 'application/vnd.apple.mpegurl' });
+                    return res.end(rewrittenText);
+                }
+            }
+
+            // If it wasn't an M3U8 (e.g., a real image), just send the original buffer
+            res.writeHead(response.status, { 'Content-Type': contentType || 'application/octet-stream' });
+            return res.end(buffer);
         }
 
-        // IT IS AN M3U8 - REWRITE URLS
-        const bodyText = await response.text();
-        
-        // Respect Coolify's reverse proxy headers for HTTPS
-        const host = req.headers.host;
-        const protocol = (req.headers['x-forwarded-proto'] || 'http').split(',')[0].trim();
-        
-        // CHANGED HERE: Use ?t= format so the player doesn't get 400 Bad Request
-        const workerBase = `${protocol}://${host}/?t=`;
-
-        const targetUrlParts = new URL(finalUrl);
-        const targetOrigin = targetUrlParts.origin;
-        const targetProtocol = targetUrlParts.protocol.replace(':', '');
-        const targetPath = targetUrlParts.pathname;
-        const targetDir = targetPath.substring(0, targetPath.lastIndexOf('/') + 1);
-
-        const lines = bodyText.split('\n');
-        const rewrittenLines = lines.map(line => {
-            const trimmed = line.trim();
-            if (trimmed === '') return line;
-
-            if (trimmed.startsWith('#')) {
-                // Handle URI="..." attributes inside tags
-                return line.replace(/URI="([^"]+)"/g, (match, uri) => {
-                    let absolute = uri;
-                    if (uri.startsWith('http://') || uri.startsWith('https://')) {
-                        absolute = uri;
-                    } else if (uri.startsWith('//')) {
-                        absolute = targetProtocol + ':' + uri;
-                    } else if (uri.startsWith('/')) {
-                        absolute = targetOrigin + uri;
-                    } else {
-                        absolute = targetOrigin + targetDir + uri;
-                    }
-                    return 'URI="' + workerBase + absolute + '"';
-                });
-            } else {
-                // Non-comment line = segment/playlist URL
-                let absolute = trimmed;
-                if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
-                    absolute = trimmed;
-                } else if (trimmed.startsWith('//')) {
-                    absolute = targetProtocol + ':' + trimmed;
-                } else if (trimmed.startsWith('/')) {
-                    absolute = targetOrigin + trimmed;
-                } else {
-                    absolute = targetOrigin + targetDir + trimmed;
-                }
-                return workerBase + absolute;
-            }
-        });
-
-        const rewrittenText = rewrittenLines.join('\n');
-        return res.end(rewrittenText);
+        // For all other files (large video segments, audio, etc.), stream directly to save memory
+        res.writeHead(response.status, { 'Content-Type': contentType || 'application/octet-stream' });
+        const reader = response.body.getReader();
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            res.write(Buffer.from(value));
+        }
+        return res.end();
 
     } catch (error) {
         console.error('[PROXY] Fetch Error:', error.message);
