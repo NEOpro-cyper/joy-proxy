@@ -30,7 +30,7 @@ const server = http.createServer(async (req, res) => {
     if (posHttp === -1 && posHttps === -1) {
         res.writeHead(400, { 'Content-Type': 'text/plain' });
         return res.end(
-            `Invalid proxy usage. Format: https://your-domain.com/https://target.com/path\n\n` +
+            `Invalid proxy usage. Format: https://your-domain.com/?t=https://target.com/path\n\n` +
             `Debug Info:\nreq.url: ${req.url}\nDecoded: ${requestUri}`
         );
     }
@@ -105,7 +105,9 @@ const server = http.createServer(async (req, res) => {
         // Respect Coolify's reverse proxy headers for HTTPS
         const host = req.headers.host;
         const protocol = (req.headers['x-forwarded-proto'] || 'http').split(',')[0].trim();
-        const workerBase = `${protocol}://${host}/`;
+        
+        // CHANGED HERE: Use ?t= format so the player doesn't get 400 Bad Request
+        const workerBase = `${protocol}://${host}/?t=`;
 
         const targetUrlParts = new URL(finalUrl);
         const targetOrigin = targetUrlParts.origin;
