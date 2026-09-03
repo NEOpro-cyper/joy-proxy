@@ -1,15 +1,11 @@
+// Bypass SSL verification globally (Mimics PHP's CURLOPT_SSL_VERIFYPEER => false)
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+
 const express = require('express');
-const { Agent } = require('undici'); // Built into Node.js 18+
 const app = express();
 
-app.use(express.raw({ type: '*/*' }));
-
-// Create an Agent that ignores SSL errors, mimicking PHP's CURLOPT_SSL_VERIFYPEER => false
-const insecureAgent = new Agent({
-    connect: {
-        rejectUnauthorized: false
-    }
-});
+// Allow parsing raw bodies for POST/PUT requests
+app.use(express.raw({ type: '*/*', limit: '50mb' }));
 
 app.use(async (req, res) => {
     // 1. Handle CORS
@@ -23,7 +19,7 @@ app.use(async (req, res) => {
         return res.status(204).end();
     }
 
-    // 2. Extract Target URL (Exactly like PHP)
+    // 2. Extract Target URL (Exactly like your PHP script)
     const requestUri = req.originalUrl;
     const posHttp = requestUri.indexOf('http://');
     const posHttps = requestUri.indexOf('https://');
@@ -37,7 +33,7 @@ app.use(async (req, res) => {
     const startPos = (posHttp !== -1 && (posHttps === -1 || posHttp < posHttps)) ? posHttp : posHttps;
     const targetUrlStr = requestUri.substring(startPos);
 
-    // 3. Prepare Headers (Matching PHP)
+    // 3. Prepare Headers (Matching your PHP cURL headers)
     const modifiedHeaders = {
         'Referer': 'https://cinejoy.to/',
         'Origin': 'https://cinejoy.to',
@@ -55,8 +51,7 @@ app.use(async (req, res) => {
     const fetchOptions = {
         method: req.method,
         headers: modifiedHeaders,
-        redirect: 'follow',
-        dispatcher: insecureAgent // Ignore SSL validation
+        redirect: 'follow'
     };
 
     if (req.method !== 'GET' && req.method !== 'HEAD') {
@@ -65,9 +60,9 @@ app.use(async (req, res) => {
 
     try {
         const response = await fetch(targetUrlStr, fetchOptions);
-        const finalUrl = response.url; // Where it finally ended up after redirects
+        const finalUrl = response.url; // Get final URL after redirects
 
-        // SPECIAL CHECK: dontscrape loop
+        // SPECIAL CHECK: dontscrape loop (From your PHP code)
         if (finalUrl.includes('dontscrape')) {
             return res.status(403).set('Content-Type', 'text/plain').send(
                 `WAF Block Detected!\nThe target server trapped this request in the dontscrape loop.\nFinal URL: ${finalUrl}\nThis means the server is actively blocking your VPS IP or the spoofed headers.`
@@ -85,7 +80,7 @@ app.use(async (req, res) => {
                 res.set('Content-Type', response.headers.get('content-type'));
             }
             
-            // Pipe the stream directly to save memory
+            // Pipe the stream directly to save memory on large files
             const reader = response.body.getReader();
             while (true) {
                 const { done, value } = await reader.read();
@@ -95,11 +90,10 @@ app.use(async (req, res) => {
             return res.end();
         }
 
-        // IT IS AN M3U8 - REWRITE URLS (Matching PHP Logic exactly)
+        // IT IS AN M3U8 - REWRITE URLS (Matching your PHP Logic exactly)
         const bodyText = await response.text();
         
-        const scriptUrl = req.protocol + '://' + req.get('host') + req.baseUrl;
-        const workerBase = scriptUrl + '/';
+        const workerBase = req.protocol + '://' + req.get('host') + '/';
 
         const targetUrlParts = new URL(finalUrl);
         const targetOrigin = targetUrlParts.origin;
