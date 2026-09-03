@@ -4,10 +4,9 @@ process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 const express = require('express');
 const app = express();
 
-// Allow parsing raw bodies for POST/PUT requests
 app.use(express.raw({ type: '*/*', limit: '50mb' }));
 
-app.use(async (req, res) => {
+app.all('*', async (req, res) => {
     // 1. Handle CORS
     res.set({
         'Access-Control-Allow-Origin': '*',
@@ -19,21 +18,27 @@ app.use(async (req, res) => {
         return res.status(204).end();
     }
 
-    // 2. Extract Target URL (Exactly like your PHP script)
-    const requestUri = req.originalUrl;
+    // 2. Extract Target URL
+    let requestUri = req.originalUrl;
+    
+    // Decode in case the proxy URL-encoded the slashes (e.g., %2F)
+    try {
+        requestUri = decodeURIComponent(requestUri);
+    } catch (e) {}
+
     const posHttp = requestUri.indexOf('http://');
     const posHttps = requestUri.indexOf('https://');
 
     if (posHttp === -1 && posHttps === -1) {
         return res.status(400).set('Content-Type', 'text/plain').send(
-            'Invalid proxy usage. Format: https://your-domain.com/https://target.com/path'
+            `Invalid proxy usage. Format: https://your-domain.com/https://target.com/path\n\nDebug Info:\nreq.url: ${req.url}\nreq.originalUrl: ${req.originalUrl}\nDecoded: ${requestUri}`
         );
     }
 
     const startPos = (posHttp !== -1 && (posHttps === -1 || posHttp < posHttps)) ? posHttp : posHttps;
     const targetUrlStr = requestUri.substring(startPos);
 
-    // 3. Prepare Headers (Matching your PHP cURL headers)
+    // 3. Prepare Headers
     const modifiedHeaders = {
         'Referer': 'https://cinejoy.to/',
         'Origin': 'https://cinejoy.to',
@@ -62,7 +67,7 @@ app.use(async (req, res) => {
         const response = await fetch(targetUrlStr, fetchOptions);
         const finalUrl = response.url; // Get final URL after redirects
 
-        // SPECIAL CHECK: dontscrape loop (From your PHP code)
+        // SPECIAL CHECK: dontscrape loop
         if (finalUrl.includes('dontscrape')) {
             return res.status(403).set('Content-Type', 'text/plain').send(
                 `WAF Block Detected!\nThe target server trapped this request in the dontscrape loop.\nFinal URL: ${finalUrl}\nThis means the server is actively blocking your VPS IP or the spoofed headers.`
@@ -75,12 +80,10 @@ app.use(async (req, res) => {
         res.status(response.status);
 
         if (!isM3u8) {
-            // Not an m3u8, pass through directly
             if (response.headers.get('content-type')) {
                 res.set('Content-Type', response.headers.get('content-type'));
             }
             
-            // Pipe the stream directly to save memory on large files
             const reader = response.body.getReader();
             while (true) {
                 const { done, value } = await reader.read();
@@ -90,7 +93,7 @@ app.use(async (req, res) => {
             return res.end();
         }
 
-        // IT IS AN M3U8 - REWRITE URLS (Matching your PHP Logic exactly)
+        // IT IS AN M3U8 - REWRITE URLS
         const bodyText = await response.text();
         
         const workerBase = req.protocol + '://' + req.get('host') + '/';
@@ -107,7 +110,6 @@ app.use(async (req, res) => {
             if (trimmed === '') return line;
 
             if (trimmed.startsWith('#')) {
-                // Handle URI="..." attributes inside tags
                 return line.replace(/URI="([^"]+)"/g, (match, uri) => {
                     let absolute = uri;
                     if (uri.startsWith('http://') || uri.startsWith('https://')) {
@@ -122,7 +124,6 @@ app.use(async (req, res) => {
                     return 'URI="' + workerBase + absolute + '"';
                 });
             } else {
-                // Non-comment line = segment/playlist URL
                 let absolute = trimmed;
                 if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
                     absolute = trimmed;
