@@ -1,18 +1,21 @@
-# Use the official Node.js 20 image (LTS)
+# Official Node.js 20 LTS image
 FROM node:20-alpine
 
-# Set the working directory inside the container
 WORKDIR /app
 
-# Copy package.json and install dependencies
+# Install only production dependencies (express was unused, undici is the new one)
 COPY package.json ./
-RUN npm install --production
+RUN npm install --omit=dev && npm cache clean --force
 
-# Copy the rest of the application code
 COPY server.js ./
 
-# Expose the port the app runs on
+ENV NODE_ENV=production \
+    PORT=3000 \
+    CACHE_MB=512
+
 EXPOSE 3000
 
-# Command to start the app
+# Run as non-root
+USER node
+
 CMD ["node", "server.js"]
