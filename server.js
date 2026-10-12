@@ -1,219 +1,277 @@
-// Bypass SSL verification globally (mimics PHP's CURLOPT_SSL_VERIFYPEER => false)
-// Requires Node 18.13+ for fetch to reliably respect this
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+'use strict';
+const cluster = require('node:cluster');
+const os = require('node:os');
+const http = require('node:http');
+const { Readable } = require('node:stream');
+const { pipeline } = require('node:stream/promises');
+const { fetch, Agent } = require('undici');
 
-const http = require('http');
-const { Readable } = require('stream');
-const { pipeline } = require('stream/promises');
+const PORT = Number(process.env.PORT || 3000);
+const WORKERS = Number(process.env.WORKERS || (os.availableParallelism ? os.availableParallelism() : os.cpus().length));
+const CACHE_MB = Number(process.env.CACHE_MB || 256);        // per worker
+const MAX_ITEM = Number(process.env.MAX_ITEM_MB || 16) * 1024 * 1024;  // largest cacheable segment
+const MAX_TEXT = 5 * 1024 * 1024;                            // largest buffered playlist/text
+const MAX_SNIFF = 3 * 1024 * 1024;
+const PLAYLIST_TTL = 3000;                                   // ms, keeps live playlists fresh
+const SEGMENT_TTL = 5 * 60 * 1000;                           // ms
+const LOAD_TIMEOUT = Number(process.env.LOAD_TIMEOUT || 20000);
 
-const PORT = process.env.PORT || 3000;
-const UPSTREAM_TIMEOUT = Number(process.env.UPSTREAM_TIMEOUT || 60000);
-
-// Built once at startup — zero per-request cost
-const SPOOFED_HEADERS = {
-  'Referer': 'https://cinejoy.pk/',
-  'Origin': 'https://cinejoy.pk',
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
-  'Accept': '*/*',
-  'Accept-Language': 'en-US,en;q=0.9',
-  'sec-fetch-dest': 'empty',
-  'sec-fetch-mode': 'cors',
-  'sec-fetch-site': 'cross-site',
-  'sec-ch-ua': '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"',
-  'sec-ch-ua-mobile': '?0',
-  'sec-ch-ua-platform': '"Windows"',
-};
-
-// Applied to EVERY response (including errors) so the browser never
-// masks a real 4xx/5xx as a "CORS error"
-const CORS_HEADERS = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-  'Access-Control-Allow-Headers': '*',
-  'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges, ETag, Last-Modified',
-};
-
-// Whitelist of upstream headers to pass through. Deliberately EXCLUDES
-// Access-Control-* (duplicate CORS headers = console errors) and
-// Content-Encoding (undici already decompressed the body).
-const PASS_THROUGH = [
-  'content-type', 'content-length', 'content-range', 'accept-ranges',
-  'etag', 'last-modified', 'cache-control', 'expires', 'content-disposition',
-];
-
-// Resolves any playlist reference (absolute, //host, /root, ../relative)
-// against the final post-redirect URL and prefixes it with the proxy
-function rewritePlaylist(text, baseUrl, proxyBase) {
-  const absolutize = (u) => {
-    try { return proxyBase + new URL(u, baseUrl).href } catch { return u }
-  };
-  return text.split('\n').map(line => {
-    const t = line.trim();
-    if (!t) return line;
-    if (t.startsWith('#')) {
-      return line.replace(/URI="([^"]+)"/g, (_, uri) => `URI="${absolutize(uri)}"`);
-    }
-    return absolutize(t);
-  }).join('\n');
+// ---------- cluster: one process per core ----------
+if (cluster.isPrimary && WORKERS > 1) {
+  for (let i = 0; i < WORKERS; i++) cluster.fork();
+  cluster.on('exit', (w) => {
+    console.error(`[cluster] worker ${w.process.pid} died, restarting`);
+    cluster.fork();
+  });
+  console.log(`Primary ${process.pid} running ${WORKERS} workers on :${PORT}`);
+} else {
+  startServer();
 }
 
-const server = http.createServer(async (req, res) => {
-  // 1. CORS — set before anything else so every response carries them
-  for (const [k, v] of Object.entries(CORS_HEADERS)) res.setHeader(k, v);
+function startServer() {
+  // ---------- pooled upstream connections ----------
+  const dispatcher = new Agent({
+    connections: 256,            // max sockets per origin per worker
+    pipelining: 1,
+    keepAliveTimeout: 30_000,
+    keepAliveMaxTimeout: 600_000,
+    headersTimeout: 15_000,      // waiting for upstream headers
+    bodyTimeout: 30_000,         // idle time between body chunks (not total time)
+    allowH2: process.env.UPSTREAM_H2 === '1',
+    connect: { rejectUnauthorized: false, timeout: 10_000 },  // scoped TLS bypass
+  });
 
-  if (req.method === 'OPTIONS') {
-    // Browser caches the preflight for 24h instead of preflighting
-    // before every single request (big speed win)
-    res.writeHead(204, { 'Access-Control-Max-Age': '86400' });
-    return res.end();
-  }
-
-  // Kill the upstream request the moment the player disconnects
-  // (seek/pause/close) — frees sockets and bandwidth immediately
-  const controller = new AbortController();
-  res.on('close', () => { if (!res.writableEnded) controller.abort(); });
-
-  // 2. Extract target URL from the raw request
-  let requestUri = req.url;
-  try {
-    if (requestUri.includes('%')) requestUri = decodeURIComponent(requestUri);
-  } catch {}
-
-  const posHttp = requestUri.indexOf('http://');
-  const posHttps = requestUri.indexOf('https://');
-  if (posHttp === -1 && posHttps === -1) {
-    res.writeHead(400, { 'Content-Type': 'text/plain' });
-    return res.end(
-      `Invalid proxy usage. Format: https://your-domain.com/?t=https://target.com/path\n\n` +
-      `Debug Info:\nreq.url: ${req.url}\nDecoded: ${requestUri}`
-    );
-  }
-  const startPos = (posHttp !== -1 && (posHttps === -1 || posHttp < posHttps)) ? posHttp : posHttps;
-  const targetUrlStr = requestUri.substring(startPos);
-
-  const isRead = req.method === 'GET' || req.method === 'HEAD';
-
-  const fetchOptions = {
-    method: req.method,
-    headers: SPOOFED_HEADERS,
-    redirect: 'follow',
-    signal: controller.signal,
+  const UPSTREAM_HEADERS = {
+    'Referer': 'https://cinejoy.pk/',
+    'Origin': 'https://cinejoy.pk',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
+    'Accept': '*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'identity',   // no decompression CPU, content-length stays valid
+    'sec-fetch-dest': 'empty',
+    'sec-fetch-mode': 'cors',
+    'sec-fetch-site': 'cross-site',
+    'sec-ch-ua': '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
   };
 
-  // 3. Stream request bodies straight through — nothing buffered in memory
-  if (!isRead) {
-    fetchOptions.body = Readable.toWeb(req);
-    fetchOptions.duplex = 'half'; // required by undici for stream bodies
+  const CORS = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': '*',
+    'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges, ETag, Last-Modified',
+  };
+  const PASS_THROUGH = [
+    'content-type', 'content-length', 'content-range', 'accept-ranges',
+    'etag', 'last-modified', 'cache-control', 'expires', 'content-disposition',
+  ];
+
+  // ---------- LRU cache bounded by bytes ----------
+  class LruCache {
+    constructor(maxBytes) { this.max = maxBytes; this.bytes = 0; this.map = new Map(); }
+    get(k) {
+      const e = this.map.get(k);
+      if (!e) return null;
+      if (e.exp < Date.now()) { this.delete(k); return null; }
+      this.map.delete(k); this.map.set(k, e);          // bump recency
+      return e;
+    }
+    set(k, e) {
+      if (e.size > this.max) return;
+      this.delete(k);
+      this.map.set(k, e);
+      this.bytes += e.size;
+      for (const [key, v] of this.map) {               // evict oldest first
+        if (this.bytes <= this.max) break;
+        this.map.delete(key); this.bytes -= v.size;
+      }
+    }
+    delete(k) {
+      const e = this.map.get(k);
+      if (e) { this.bytes -= e.size; this.map.delete(k); }
+    }
+  }
+  const cache = new LruCache(CACHE_MB * 1024 * 1024);
+  const inflight = new Map();   // key -> Promise<entry>  (request coalescing)
+
+  // ---------- helpers ----------
+  function rewritePlaylist(text, baseUrl, proxyBase) {
+    const absolutize = (u) => { try { return proxyBase + new URL(u, baseUrl).href; } catch { return u; } };
+    return text.split('\n').map((line) => {
+      const t = line.trim();
+      if (!t) return line;
+      if (t.startsWith('#')) return line.replace(/URI="([^"]+)"/g, (_, uri) => `URI="${absolutize(uri)}"`);
+      return absolutize(t);
+    }).join('\n');
   }
 
-  // Hard deadline so a stalled upstream can't hang the connection forever
-  const timer = setTimeout(() => controller.abort(new Error('Upstream timeout')), UPSTREAM_TIMEOUT);
-
-  try {
-    const response = await fetch(targetUrlStr, fetchOptions);
-    const finalUrl = response.url; // post-redirect URL — required for correct relative-URL rewriting
-    const contentType = response.headers.get('content-type') || '';
-
-    // WAF trap check
-    if (finalUrl.includes('dontscrape')) {
-      res.writeHead(403, { 'Content-Type': 'text/plain' });
-      return res.end(
-        `WAF Block Detected!\nThe target server trapped this request in the dontscrape loop.\n` +
-        `Final URL: ${finalUrl}\nThis means the server is actively blocking your VPS IP or the spoofed headers.`
-      );
-    }
-
-    // Build response headers from the whitelist (never forwards upstream CORS headers)
-    const contentEncoding = response.headers.get('content-encoding');
-    const outHeaders = {};
+  function passHeaders(up) {
+    const out = {};
+    const enc = up.headers.get('content-encoding');
     for (const h of PASS_THROUGH) {
-      if (h === 'content-length' && contentEncoding) continue; // body was decompressed; length invalid
-      const v = response.headers.get(h);
-      if (v !== null) outHeaders[h] = v;
+      if (h === 'content-length' && enc && enc !== 'identity') continue;
+      const v = up.headers.get(h);
+      if (v !== null) out[h] = v;
     }
-    if (!outHeaders['content-type']) outHeaders['content-type'] = 'application/octet-stream';
-    // Let the browser cache responses; playlists stay fresh, segments cache 1h
-    if (!outHeaders['cache-control'] && response.status < 400) {
-      outHeaders['cache-control'] = (contentType.includes('mpegurl') || targetUrlStr.endsWith('.m3u8'))
-        ? 'public, max-age=5'
-        : 'public, max-age=3600';
-    }
+    if (!out['content-type']) out['content-type'] = 'application/octet-stream';
+    return out;
+  }
 
-    // Bodyless responses: 204/304, HEAD, or no body
-    if (req.method === 'HEAD' || response.status === 204 || response.status === 304 || !response.body) {
-      res.writeHead(response.status, outHeaders);
+  // Cheap check so we never stringify multi-MB binary just to sniff it
+  function sniffPlaylist(buf) {
+    if (buf.length > MAX_SNIFF) return null;
+    const head = buf.subarray(0, 64).toString('latin1');
+    if (head.trim().startsWith('#EXTM3U')) return { text: buf.toString('utf8'), base64: false };
+    if (/^[A-Za-z0-9+/=\s]+$/.test(head)) {
+      const raw = buf.toString('latin1');
+      if (/^[A-Za-z0-9+/=\s]+$/.test(raw.trim())) {
+        const dec = Buffer.from(raw, 'base64').toString('utf8');
+        if (dec.trim().startsWith('#EXTM3U')) return { text: dec, base64: true };
+      }
+    }
+    return null;
+  }
+
+  function send(res, status, headers, body) {
+    res.writeHead(status, { ...CORS, ...headers });
+    res.end(body);
+  }
+
+  // ---------- shared loader (one upstream fetch, many waiters) ----------
+  async function load(target, proxyBase) {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), LOAD_TIMEOUT);
+    try {
+      const up = await fetch(target, {
+        headers: UPSTREAM_HEADERS, redirect: 'follow', dispatcher, signal: ac.signal,
+      });
+      const finalUrl = up.url;
+
+      if (finalUrl.includes('dontscrape')) {
+        const body = Buffer.from(`Upstream blocked the request.\nFinal URL: ${finalUrl}\n`);
+        return { status: 403, headers: { 'content-type': 'text/plain' }, body, size: body.length, exp: 0 };
+      }
+
+      const ct = up.headers.get('content-type') || '';
+      const cl = Number(up.headers.get('content-length') ?? -1);
+      const textLike = /\.m3u8(\?|$)/i.test(finalUrl) || ct.includes('mpegurl') || ct.startsWith('text/');
+      const imgExt = /\.(jpe?g|png|gif)(\?|$)/i.test(target);
+      const canBuffer = up.status !== 206 && !!up.body && (
+        (textLike || imgExt || up.status >= 400)
+          ? (cl === -1 || cl <= (imgExt ? MAX_ITEM : MAX_TEXT))
+          : (cl >= 0 && cl <= MAX_ITEM)
+      );
+
+      // Too big / unknown length: hand the live response to the caller to stream
+      if (!canBuffer) return { stream: true, up, ac };
+
+      const buf = Buffer.from(await up.arrayBuffer());
+      const headers = passHeaders(up);
+      delete headers['content-length'];
+      let body = buf;
+      let isM3u8 = false;
+
+      if (textLike || imgExt) {
+        const sn = sniffPlaylist(buf);
+        if (sn) {
+          isM3u8 = true;
+          let out = rewritePlaylist(sn.text, finalUrl, proxyBase);
+          if (sn.base64) { out = Buffer.from(out).toString('base64'); }
+          else headers['content-type'] = 'application/vnd.apple.mpegurl';
+          body = Buffer.from(out);
+        }
+      }
+
+      if (!headers['cache-control'] && up.status < 400) {
+        headers['cache-control'] = isM3u8 ? 'public, max-age=5' : 'public, max-age=3600';
+      }
+      const ttl = up.status === 200 ? (isM3u8 ? PLAYLIST_TTL : SEGMENT_TTL) : 0;
+      return { status: up.status, headers, body, size: body.length, exp: Date.now() + ttl };
+    } finally {
+      clearTimeout(timer);   // streaming stalls are covered by the Agent's bodyTimeout
+    }
+  }
+
+  async function streamUpstream(res, up, ac, method) {
+    res.on('close', () => { if (!res.writableEnded) ac.abort(); });  // free upstream when player leaves
+    const headers = passHeaders(up);
+    if (method === 'HEAD' || !up.body || up.status === 204 || up.status === 304) {
+      send(res, up.status, headers);
+      ac.abort();
+      return;
+    }
+    res.writeHead(up.status, { ...CORS, ...headers });
+    await pipeline(Readable.fromWeb(up.body), res);   // honors backpressure
+  }
+
+  async function direct(req, res, target) {
+    const ac = new AbortController();
+    const headers = { ...UPSTREAM_HEADERS };
+    if (req.headers.range) headers['Range'] = req.headers.range;
+    if (req.headers['if-range']) headers['If-Range'] = req.headers['if-range'];
+    const isRead = req.method === 'GET' || req.method === 'HEAD';
+    res.on('close', () => { if (!res.writableEnded) ac.abort(); });
+    const opts = { method: req.method, headers, redirect: 'follow', dispatcher, signal: ac.signal };
+    if (!isRead) { opts.body = Readable.toWeb(req); opts.duplex = 'half'; }
+    const up = await fetch(target, opts);
+    await streamUpstream(res, up, ac, req.method);
+  }
+
+  // ---------- server ----------
+  const server = http.createServer(async (req, res) => {
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, { ...CORS, 'Access-Control-Max-Age': '86400' });
       return res.end();
     }
 
-    // Text-like responses may hide an m3u8 — sniff them
-    const isPotentialM3u8 =
-      targetUrlStr.endsWith('.m3u8') ||
-      finalUrl.endsWith('.m3u8') ||
-      ['.jpg', '.png', '.jpeg', '.gif'].some(ext => targetUrlStr.endsWith(ext)) ||
-      contentType.includes('mpegurl') ||
-      contentType.includes('text/');
+    let uri = req.url;
+    try { if (uri.includes('%')) uri = decodeURIComponent(uri); } catch {}
+    const pH = uri.indexOf('http://'), pS = uri.indexOf('https://');
+    if (pH === -1 && pS === -1) {
+      return send(res, 400, { 'content-type': 'text/plain' },
+        'Invalid proxy usage. Format: https://your-domain.com/?t=https://target.com/path');
+    }
+    const target = uri.substring((pH !== -1 && (pS === -1 || pH < pS)) ? pH : pS);
 
-    if (isPotentialM3u8) {
-      const buffer = Buffer.from(await response.arrayBuffer());
-      let bodyText = buffer.toString('utf-8');
-      let isBase64 = false;
-      let isM3u8 = false;
+    try {
+      // Only plain GETs (no Range) can be cached/coalesced
+      if (req.method === 'GET' && !req.headers.range) {
+        const proto = (req.headers['x-forwarded-proto'] || 'http').split(',')[0].trim();
+        const proxyBase = `${proto}://${req.headers.host}/?t=`;
+        const key = proxyBase + target;
 
-      // Guard the base64 sniff to small bodies — don't regex multi-MB HTML
-      if (bodyText.length < 3_000_000 && /^[a-zA-Z0-9+/=\s]+$/.test(bodyText.trim())) {
-        try {
-          const decoded = Buffer.from(bodyText, 'base64').toString('utf-8');
-          if (decoded.trim().startsWith('#EXTM3U')) {
-            isBase64 = true;
-            isM3u8 = true;
-            bodyText = decoded;
+        let entry = cache.get(key);
+        let leader = false;
+        if (!entry) {
+          let p = inflight.get(key);
+          if (!p) {
+            leader = true;
+            p = load(target, proxyBase).finally(() => inflight.delete(key));
+            inflight.set(key, p);
           }
-        } catch {}
-      }
-      if (!isM3u8 && bodyText.trim().startsWith('#EXTM3U')) isM3u8 = true;
-
-      if (isM3u8) {
-        const proxyBase = `${(req.headers['x-forwarded-proto'] || 'http').split(',')[0].trim()}://${req.headers.host}/?t=`;
-        let rewritten = rewritePlaylist(bodyText, finalUrl, proxyBase);
-
-        delete outHeaders['content-length']; // length changed after rewrite
-        if (isBase64) {
-          rewritten = Buffer.from(rewritten).toString('base64');
-          outHeaders['content-type'] = contentType || 'application/octet-stream';
-        } else {
-          outHeaders['content-type'] = 'application/vnd.apple.mpegurl';
+          entry = await p;
+          if (!entry.stream && entry.exp > Date.now()) cache.set(key, entry);
         }
 
-        res.writeHead(response.status, outHeaders);
-        return res.end(rewritten);
+        if (entry.stream) {
+          // Only the leader owns the live response; followers fetch their own stream
+          if (leader) return await streamUpstream(res, entry.up, entry.ac, 'GET');
+          return await direct(req, res, target);
+        }
+        return send(res, entry.status, { ...entry.headers, 'content-length': entry.size }, entry.body);
       }
 
-      // Real image/file — send as-is
-      res.writeHead(response.status, outHeaders);
-      return res.end(buffer);
+      await direct(req, res, target);   // Range / HEAD / POST etc.
+    } catch (err) {
+      if (res.headersSent || res.destroyed) return res.destroy();
+      console.error('[PROXY]', err.message);
+      send(res, 502, { 'content-type': 'text/plain' }, 'Error: ' + err.message);
     }
+  });
 
-    // Everything else (video segments, keys, audio): stream WITH backpressure.
-    // pipeline() pauses the upstream read when res.write() returns false,
-    // keeping memory flat no matter how slow the client is.
-    res.writeHead(response.status, outHeaders);
-    await pipeline(Readable.fromWeb(response.body), res);
-
-  } catch (error) {
-    // Client disconnects mid-stream land here too — nothing left to send them
-    if (res.headersSent || res.destroyed) return res.destroy();
-    console.error('[PROXY] Fetch Error:', error.message);
-    res.writeHead(500, { 'Content-Type': 'text/plain' }); // CORS headers already applied
-    return res.end('Error: ' + error.message);
-  } finally {
-    clearTimeout(timer);
-  }
-});
-
-// Prevents "socket hang up" from Cloudflare/nginx (they idle ~60s)
-server.keepAliveTimeout = 65000;
-server.headersTimeout = 66000;
-
-server.listen(PORT, () => {
-  console.log(`Pure Node.js proxy server running on port ${PORT}`);
-});
+  server.keepAliveTimeout = 65_000;
+  server.headersTimeout = 66_000;
+  server.requestTimeout = 0;          // don't kill long video streams
+  server.listen(PORT, () => console.log(`Worker ${process.pid} listening on :${PORT}`));
+}
