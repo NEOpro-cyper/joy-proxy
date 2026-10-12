@@ -7,13 +7,14 @@ const { pipeline } = require('node:stream/promises');
 const { fetch, Agent } = require('undici');
 
 const PORT = Number(process.env.PORT || 3000);
-const WORKERS = Number(process.env.WORKERS || (os.availableParallelism ? os.availableParallelism() : os.cpus().length));
-const CACHE_MB = Number(process.env.CACHE_MB || 256);        // per worker
+const CPUS = os.availableParallelism ? os.availableParallelism() : os.cpus().length;
+const WORKERS = Number(process.env.WORKERS || CPUS);
+const CACHE_MB = Number(process.env.CACHE_MB || 128);                  // per worker
 const MAX_ITEM = Number(process.env.MAX_ITEM_MB || 16) * 1024 * 1024;  // largest cacheable segment
-const MAX_TEXT = 5 * 1024 * 1024;                            // largest buffered playlist/text
+const MAX_TEXT = 5 * 1024 * 1024;                                      // largest buffered playlist/text
 const MAX_SNIFF = 3 * 1024 * 1024;
-const PLAYLIST_TTL = 3000;                                   // ms, keeps live playlists fresh
-const SEGMENT_TTL = 5 * 60 * 1000;                           // ms
+const PLAYLIST_TTL = 3000;                                             // ms, keeps live playlists fresh
+const SEGMENT_TTL = 5 * 60 * 1000;                                     // ms
 const LOAD_TIMEOUT = Number(process.env.LOAD_TIMEOUT || 20000);
 
 // ---------- cluster: one process per core ----------
@@ -31,14 +32,14 @@ if (cluster.isPrimary && WORKERS > 1) {
 function startServer() {
   // ---------- pooled upstream connections ----------
   const dispatcher = new Agent({
-    connections: 256,            // max sockets per origin per worker
+    connections: 256,
     pipelining: 1,
     keepAliveTimeout: 30_000,
     keepAliveMaxTimeout: 600_000,
-    headersTimeout: 15_000,      // waiting for upstream headers
-    bodyTimeout: 30_000,         // idle time between body chunks (not total time)
+    headersTimeout: 15_000,
+    bodyTimeout: 30_000,
     allowH2: process.env.UPSTREAM_H2 === '1',
-    connect: { rejectUnauthorized: false, timeout: 10_000 },  // scoped TLS bypass
+    connect: { rejectUnauthorized: false, timeout: 10_000 },
   });
 
   const UPSTREAM_HEADERS = {
@@ -47,7 +48,7 @@ function startServer() {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
     'Accept': '*/*',
     'Accept-Language': 'en-US,en;q=0.9',
-    'Accept-Encoding': 'identity',   // no decompression CPU, content-length stays valid
+    'Accept-Encoding': 'identity',
     'sec-fetch-dest': 'empty',
     'sec-fetch-mode': 'cors',
     'sec-fetch-site': 'cross-site',
@@ -74,7 +75,7 @@ function startServer() {
       const e = this.map.get(k);
       if (!e) return null;
       if (e.exp < Date.now()) { this.delete(k); return null; }
-      this.map.delete(k); this.map.set(k, e);          // bump recency
+      this.map.delete(k); this.map.set(k, e);
       return e;
     }
     set(k, e) {
@@ -82,7 +83,7 @@ function startServer() {
       this.delete(k);
       this.map.set(k, e);
       this.bytes += e.size;
-      for (const [key, v] of this.map) {               // evict oldest first
+      for (const [key, v] of this.map) {
         if (this.bytes <= this.max) break;
         this.map.delete(key); this.bytes -= v.size;
       }
@@ -93,7 +94,7 @@ function startServer() {
     }
   }
   const cache = new LruCache(CACHE_MB * 1024 * 1024);
-  const inflight = new Map();   // key -> Promise<entry>  (request coalescing)
+  const inflight = new Map();
 
   // ---------- helpers ----------
   function rewritePlaylist(text, baseUrl, proxyBase) {
@@ -118,7 +119,6 @@ function startServer() {
     return out;
   }
 
-  // Cheap check so we never stringify multi-MB binary just to sniff it
   function sniffPlaylist(buf) {
     if (buf.length > MAX_SNIFF) return null;
     const head = buf.subarray(0, 64).toString('latin1');
@@ -163,7 +163,6 @@ function startServer() {
           : (cl >= 0 && cl <= MAX_ITEM)
       );
 
-      // Too big / unknown length: hand the live response to the caller to stream
       if (!canBuffer) return { stream: true, up, ac };
 
       const buf = Buffer.from(await up.arrayBuffer());
@@ -177,7 +176,7 @@ function startServer() {
         if (sn) {
           isM3u8 = true;
           let out = rewritePlaylist(sn.text, finalUrl, proxyBase);
-          if (sn.base64) { out = Buffer.from(out).toString('base64'); }
+          if (sn.base64) out = Buffer.from(out).toString('base64');
           else headers['content-type'] = 'application/vnd.apple.mpegurl';
           body = Buffer.from(out);
         }
@@ -189,12 +188,12 @@ function startServer() {
       const ttl = up.status === 200 ? (isM3u8 ? PLAYLIST_TTL : SEGMENT_TTL) : 0;
       return { status: up.status, headers, body, size: body.length, exp: Date.now() + ttl };
     } finally {
-      clearTimeout(timer);   // streaming stalls are covered by the Agent's bodyTimeout
+      clearTimeout(timer);
     }
   }
 
   async function streamUpstream(res, up, ac, method) {
-    res.on('close', () => { if (!res.writableEnded) ac.abort(); });  // free upstream when player leaves
+    res.on('close', () => { if (!res.writableEnded) ac.abort(); });
     const headers = passHeaders(up);
     if (method === 'HEAD' || !up.body || up.status === 204 || up.status === 304) {
       send(res, up.status, headers);
@@ -202,7 +201,7 @@ function startServer() {
       return;
     }
     res.writeHead(up.status, { ...CORS, ...headers });
-    await pipeline(Readable.fromWeb(up.body), res);   // honors backpressure
+    await pipeline(Readable.fromWeb(up.body), res);
   }
 
   async function direct(req, res, target) {
@@ -235,7 +234,6 @@ function startServer() {
     const target = uri.substring((pH !== -1 && (pS === -1 || pH < pS)) ? pH : pS);
 
     try {
-      // Only plain GETs (no Range) can be cached/coalesced
       if (req.method === 'GET' && !req.headers.range) {
         const proto = (req.headers['x-forwarded-proto'] || 'http').split(',')[0].trim();
         const proxyBase = `${proto}://${req.headers.host}/?t=`;
@@ -255,14 +253,13 @@ function startServer() {
         }
 
         if (entry.stream) {
-          // Only the leader owns the live response; followers fetch their own stream
           if (leader) return await streamUpstream(res, entry.up, entry.ac, 'GET');
           return await direct(req, res, target);
         }
         return send(res, entry.status, { ...entry.headers, 'content-length': entry.size }, entry.body);
       }
 
-      await direct(req, res, target);   // Range / HEAD / POST etc.
+      await direct(req, res, target);
     } catch (err) {
       if (res.headersSent || res.destroyed) return res.destroy();
       console.error('[PROXY]', err.message);
@@ -272,6 +269,6 @@ function startServer() {
 
   server.keepAliveTimeout = 65_000;
   server.headersTimeout = 66_000;
-  server.requestTimeout = 0;          // don't kill long video streams
+  server.requestTimeout = 0;
   server.listen(PORT, () => console.log(`Worker ${process.pid} listening on :${PORT}`));
 }
