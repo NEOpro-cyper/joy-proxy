@@ -1,12 +1,15 @@
 {
   "name": "cors-hls-proxy",
-  "version": "1.0.0",
-  "description": "CORS and HLS Proxy for VPS",
+  "version": "2.0.0",
+  "description": "CORS and HLS Proxy for VPS (cached, coalesced, clustered)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
+  "engines": {
+    "node": ">=18.14"
+  },
   "dependencies": {
-    "express": "^4.19.2"
+    "undici": "^6.21.0"
   }
 }
